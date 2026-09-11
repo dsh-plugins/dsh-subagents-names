@@ -1,0 +1,4 @@
+# dsh-subagents-names bundle patch layer.
+- insert:
+    - id: subagents-names
+      name: dsh-subagents-names

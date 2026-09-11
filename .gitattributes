@@ -1,0 +1,2 @@
+# 客户端 bundle 会被 DSH 原样从磁盘读取，因此仓库与工作区统一使用 LF。
+* text=auto eol=lf

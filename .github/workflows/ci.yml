@@ -1,0 +1,92 @@
+name: CI 与 npm 发布
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: '24'
+  NPM_REGISTRY: 'https://registry.npmjs.org'
+
+jobs:
+  quality:
+    name: 质量检查（${{ matrix.os }}）
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+    steps:
+      - name: 检出
+        uses: actions/checkout@v6
+      - name: 配置 Node.js
+        uses: actions/setup-node@v6.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: 编码检查（UTF-8 无 BOM）
+        run: npm run check:encoding
+      - name: 运行测试
+        run: npm test
+      - name: 检查即将发布的包内容
+        run: npm pack --dry-run
+
+  publish:
+    name: 发布到 npm
+    needs: quality
+    # 只有携带 NPM_TOKEN 的正式 tag 推送才会发布；普通 PR / main 推送只做质量检查。
+    if: >-
+      github.event_name == 'push' &&
+      startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: 检出
+        uses: actions/checkout@v6
+      - name: 配置 Node.js
+        uses: actions/setup-node@v6.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: ${{ env.NPM_REGISTRY }}
+      - name: 校验 tag 与 package.json 版本一致
+        shell: bash
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          BASE_VERSION="$(node -p "require('./package.json').version")"
+          if [[ "$REF_NAME" != "v$BASE_VERSION" ]]; then
+            echo "::error::tag $REF_NAME 必须与 package.json 的 v$BASE_VERSION 完全一致"
+            exit 1
+          fi
+      - name: 发布
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${NODE_AUTH_TOKEN:-}" ]]; then
+            echo "未配置 NPM_TOKEN，跳过 npm 发布（仓库与 tag 仍然可用）。"
+            exit 0
+          fi
+
+          VERSION="$(node -p "require('./package.json').version")"
+          NAME="$(node -p "require('./package.json').name")"
+          if npm view "${NAME}@${VERSION}" version --registry="$NPM_REGISTRY" >/dev/null 2>&1; then
+            echo "${NAME}@${VERSION} 已存在，跳过发布。"
+            exit 0
+          fi
+          npm publish --access public --provenance
