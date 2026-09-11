@@ -4,11 +4,11 @@
  * 客户端半边是浏览器 bundle，因此这里按 DSH Web 模块系统加载它的方式来加载
  * 已发布的 `lib/client.js`：执行脚本、捕获
  * `window.__ModuleLoader__.load({id, factory})` 注册、再用桩版 `require`
- * 物化 factory。之后的所有环节——slot 注册、注入面、组件里的重命名与归档
+ * 物化 factory。之后所有环节——座席注册、注入面、目录树渲染、重命名与归档
  * 路径——都在镜像当前 `@deepseek-ai/dsh-client-*` 契约的假实现上真实运行。
  */
 import assert from "node:assert/strict";
-import test from "node:test";
+import test, { afterEach } from "node:test";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -18,28 +18,46 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const CLIENT_SOURCE = readFileSync(join(HERE, "..", "lib", "client.js"), "utf8");
 
 /**
- * 最小 React 桩：只覆盖 `createElement` 与 bundle 实际使用的 hooks。
- * 状态按 hook 槽位跨渲染持久保存，与真实函数组件一致。
+ * 测试期间创建的定时器登记表。
+ *
+ * 组件的耗时指标会在有运行中后代时每秒刷新，测试里不会走真实卸载流程，
+ * 因此由 afterEach 统一清理，否则测试进程不会退出。
  */
+const liveTimers = new Set();
+afterEach(() => {
+  for (const timer of liveTimers) {
+    clearTimeout(timer);
+    clearInterval(timer);
+  }
+  liveTimers.clear();
+});
+
+/** 最小 React 桩：createElement + bundle 实际使用的 hooks。 */
 function createReact() {
-  let render = null;
-  let stored = { state: [], memos: [], effects: [] };
+  let active = false;
+  let stored = { state: [], memos: [], effects: [], index: 0 };
   let invalidate = null;
 
-  const element = (type, props, ...children) => ({
-    $$dsnElement: true,
-    type,
-    props: {
+  const element = (type, props, ...children) => {
+    const composed = {
       ...(props ?? {}),
       ...(children.length === 0 ? {} : children.length === 1 ? { children: children[0] } : { children }),
-    },
-  });
-
-  const hook = () => {
-    assert.ok(render !== null, "hook 在渲染过程之外被调用");
-    return render.index++;
+    };
+    // 真实 React 由渲染器把宿主节点写进 ref；测试桩在这里补上这一步，
+    // 否则依赖 triggerRef.current 的定位/打开逻辑会提前返回。
+    if (composed.ref && typeof composed.ref === "object") {
+      composed.ref.current = { getBoundingClientRect: () => ({ bottom: 40, left: 24 }) };
+    }
+    // 真实 React 会递归渲染函数组件；测试桩就地展开它们，这样断言可以直接
+    // 作用在最终的宿主元素树上。
+    if (typeof type === "function") return type(composed);
+    return { $$dsnElement: true, type, props: composed };
   };
 
+  const hook = () => {
+    assert.ok(active, "hook 在渲染过程之外被调用");
+    return stored.index++;
+  };
   const sameDeps = (left, right) => {
     if (left === undefined || right === undefined) return false;
     if (left.length !== right.length) return false;
@@ -48,18 +66,22 @@ function createReact() {
 
   const react = {
     createElement: element,
+    Fragment: Symbol.for("dsn.fragment"),
     useState(initial) {
       const index = hook();
       if (!(index in stored.state)) stored.state[index] = typeof initial === "function" ? initial() : initial;
-      return [
-        stored.state[index],
-        (next) => {
-          stored.state[index] = typeof next === "function" ? next(stored.state[index]) : next;
-          // 真实组件在写入状态后会重新渲染；测试桩只做脏标记，由 dispatch
-          // 在事件处理返回后统一刷新。
-          if (invalidate !== null) invalidate();
-        },
-      ];
+      return [stored.state[index], (next) => {
+        stored.state[index] = typeof next === "function" ? next(stored.state[index]) : next;
+        if (invalidate !== null) invalidate();
+      }];
+    },
+    useReducer(reducer, initial) {
+      const index = hook();
+      if (!(index in stored.state)) stored.state[index] = initial;
+      return [stored.state[index], (action) => {
+        stored.state[index] = reducer(stored.state[index], action);
+        if (invalidate !== null) invalidate();
+      }];
     },
     useRef(initial) {
       const index = hook();
@@ -86,31 +108,40 @@ function createReact() {
 
   return {
     react,
-    element,
-    beginRender: () => { render = { index: 0 }; },
+    beginRender: () => { stored.index = 0; active = true; },
     setInvalidate: (fn) => { invalidate = fn; },
-    resetHooks: () => { stored = { state: [], memos: [], effects: [] }; },
+    resetHooks: () => { stored = { state: [], memos: [], effects: [], index: 0 }; active = false; },
+  };
+}
+
+/** 极简 DOM 桩：只需要查询接口与 portal 的挂载点。 */
+function createDocumentStub() {
+  const make = () => ({ children: [], appendChild(node) { this.children.push(node); } });
+  return {
+    head: make(),
+    body: make(),
+    querySelector: () => null,
+    createElement: () => ({ dataset: {}, textContent: "", remove() {} }),
+    addEventListener() {},
+    removeEventListener() {},
+    activeElement: null,
   };
 }
 
 /** 加载并物化已发布的客户端 bundle。 */
-function loadBundle() {
+function loadBundle(seed = {}) {
   const registration = { id: undefined, factory: undefined };
-  const localStorageData = new Map();
-  const styleElements = [];
+  const localStorageData = new Map(Object.entries(seed));
+  const documentStub = createDocumentStub();
 
-  const documentStub = {
-    querySelector: () => null,
-    createElement: () => ({ dataset: {}, textContent: "", remove() {} }),
-    head: { appendChild: (element) => styleElements.push(element) },
-    addEventListener() {},
-    removeEventListener() {},
-  };
   const windowStub = {
+    innerWidth: 1200,
     localStorage: {
       getItem: (key) => (localStorageData.has(key) ? localStorageData.get(key) : null),
       setItem: (key, value) => localStorageData.set(key, value),
     },
+    addEventListener() {},
+    removeEventListener() {},
     __ModuleLoader__: {
       load: (entry) => {
         registration.id = entry.id;
@@ -119,15 +150,34 @@ function loadBundle() {
     },
   };
 
-  const icons = {
-    IconAgentPresetOutline16: (props) => ({ $$icon: "agent", props }),
-    IconCheckOutline16: (props) => ({ $$icon: "check", props }),
-    IconCloseOutline16: (props) => ({ $$icon: "close", props }),
-    IconEditOutline16: (props) => ({ $$icon: "edit", props }),
-  };
-
+  const icons = new Proxy({}, { get: () => (props) => ({ $$icon: props }) });
   const shim = createReact();
-  const sandbox = { window: windowStub, document: documentStub, localStorage: windowStub.localStorage, console };
+  const sandbox = {
+    window: windowStub,
+    document: documentStub,
+    localStorage: windowStub.localStorage,
+    console,
+    setTimeout: (fn, ms) => {
+      const timer = setTimeout(fn, ms);
+      liveTimers.add(timer);
+      return timer;
+    },
+    clearTimeout: (timer) => {
+      liveTimers.delete(timer);
+      clearTimeout(timer);
+    },
+    setInterval: (fn, ms) => {
+      const timer = setInterval(fn, ms);
+      liveTimers.add(timer);
+      return timer;
+    },
+    clearInterval: (timer) => {
+      liveTimers.delete(timer);
+      clearInterval(timer);
+    },
+    queueMicrotask,
+    Node: class Node {},
+  };
   sandbox.globalThis = sandbox;
   vm.createContext(sandbox);
   vm.runInContext(CLIENT_SOURCE, sandbox, { filename: "lib/client.js" });
@@ -136,35 +186,32 @@ function loadBundle() {
 
   const requireStub = (specifier) => {
     if (specifier === "react") return shim.react;
+    if (specifier === "react-dom") return { createPortal: (node) => node };
     if (specifier === "@deepseek-ai/dsh-client-ui-primitives") return icons;
     throw new Error(`未预期的 require：${specifier}`);
   };
 
-  const exports = registration.factory(requireStub);
-  return { exports, ...shim, documentStub, localStorageData, styleElements };
+  return {
+    exports: registration.factory(requireStub),
+    ...shim,
+    documentStub,
+    localStorageData,
+    windowStub,
+  };
 }
 
-/** 构造假的客户端 ctx，记录注册项与注入面。 */
+/** 构造假的客户端 ctx 与座席 props。 */
 function harness(options = {}) {
-  const bundle = loadBundle();
+  const bundle = loadBundle(options.localStorageSeed ?? {});
   bundle.resetHooks();
 
-  const effects = [];
   const held = new Map();
   const registration = { options: undefined, component: undefined };
-  const calls = {
-    archiveSession: [],
-    refreshSubagents: [],
-    catalogOpen: [],
-    openSubagent: [],
-    open: [],
-    rename: [],
-  };
+  const calls = { openSubagent: [], refreshSubagents: [], catalogOpen: [], archive: [], rename: [] };
 
-  const current = options.current ?? "parent";
   const ctx = {
     effect: (factory) => {
-      effects.push(factory());
+      factory();
       return () => {};
     },
     slots: {
@@ -179,95 +226,52 @@ function harness(options = {}) {
       },
     },
     sessions: {
-      list: { getSnapshot: () => ({ current }) },
+      list: { getSnapshot: () => ({ current: options.current }) },
       binding: (id) => options.binding?.(id),
       refreshSubagents: (id) => {
         calls.refreshSubagents.push(id);
         return Promise.resolve();
       },
       setSubagentCatalogOpen: (id, open) => calls.catalogOpen.push([id, open]),
-      subagentAddress: (id) => options.addresses?.[id],
       openSubagent: (address) => calls.openSubagent.push(address),
-      open: (id) => calls.open.push(id),
     },
     workspaces: {
       archiveSession: (id) => {
-        calls.archiveSession.push(id);
+        calls.archive.push(id);
         return options.archiveSession ? options.archiveSession(id) : Promise.resolve();
       },
     },
   };
 
   bundle.exports.apply(ctx);
-  assert.ok(held.has("conversation.session.header.actions"), "必须申请会话页头动作座席");
-  // 模拟声明已提交：ui-slots 会在那一刻运行回调。
-  const disposer = held.get("conversation.session.header.actions")();
-  assert.equal(typeof disposer, "function", "注入回调必须返回注册释放器");
+  assert.ok(held.has("conversation.session.header.lineage"), "必须接管官方谱系座席");
+  // 模拟声明提交：ui-slots 在那一刻运行回调。
+  held.get("conversation.session.header.lineage")();
 
-  return attachFlush({ ...bundle, ctx, effects, registration, calls, current });
+  return attachFlush({ ...bundle, ctx, registration, calls, options });
 }
 
-/**
- * 渲染注册的组件。渲染使用记忆化的 props，并缓存注入面（真实的 ui-slots
- * 只为每条注册构造一次注入面）。
- *
- * 状态写入不在这里立刻重渲染：真实 React 会在事件处理返回之后重渲染，
- * 因此由 `dispatch` 标记脏状态、再由 `h.flush()` 统一刷新。
- */
+/** 渲染座席组件；props 记忆化，注入面只构造一次。 */
 function render(h, props = {}) {
-  if (props.byId !== undefined || props.subagentsByParent !== undefined || props.archivedSessionIds !== undefined) {
+  if (props.lineageSessionId !== undefined || props.rows !== undefined || props.catalogs !== undefined) {
     h.memoizedProps = props;
   }
   const effective = h.memoizedProps ?? {};
-  const { registration } = h;
-  if (h.injected === undefined) h.injected = registration.options.inject(h.current);
+  if (h.injected === undefined) h.injected = h.registration.options.inject();
+  const rows = effective.rows ?? {};
   const standard = {
-    sessionId: h.current,
-    useSessions: (selector) => selector({ byId: effective.byId ?? {}, subagentsByParent: effective.subagentsByParent ?? {} }),
+    lineageSessionId: effective.lineageSessionId ?? h.options.current,
+    displayTitle: effective.displayTitle,
+    openTitle: effective.openTitle,
+    useSessions: (selector) => selector({ byId: rows, subagentsByParent: effective.catalogs ?? {} }),
     useWorkspaces: (selector) => selector({ archivedSessionIds: effective.archivedSessionIds ?? [] }),
   };
   h.setInvalidate(() => { h.dirty = true; });
   h.beginRender();
-  h.latest = registration.component({ ...standard, ...h.injected, ...effective.overrides });
+  h.latest = h.registration.component({ ...standard, ...h.injected, ...effective.overrides });
   return h.latest;
 }
 
-/** 遍历元素树，收集所有满足 `match` 的元素。 */
-function find(element, match, found = []) {
-  if (element === null || typeof element !== "object") return found;
-  if (Array.isArray(element)) {
-    for (const child of element) find(child, match, found);
-    return found;
-  }
-  if (element.$$dsnElement === true) {
-    if (match(element)) found.push(element);
-    find(element.props.children, match, found);
-  }
-  return found;
-}
-
-const byClass = (name) => (element) => element.props.className === name;
-
-/**
- * 转发一次 React 事件；事件处理返回后，只要组件写过状态就重渲染一次，
- * 与真实 React 的“事件结束后刷新”一致。传入 harness 即可获得自动刷新。
- */
-function dispatch(element, handler, event = {}, h = undefined) {
-  assert.ok(element, `期望存在带 ${handler} 的元素`);
-  const fn = element.props[handler];
-  assert.equal(typeof fn, "function", `期望存在 ${handler} 处理函数`);
-  const result = fn({
-    preventDefault() {},
-    stopPropagation() {},
-    target: {},
-    key: undefined,
-    ...event,
-  });
-  if (h !== undefined) h.flush();
-  return result;
-}
-
-/** 组件生命周期内的重渲染入口。 */
 function attachFlush(h) {
   h.flush = () => {
     if (h.dirty !== true) return h.latest;
@@ -277,12 +281,6 @@ function attachFlush(h) {
   return h;
 }
 
-/**
- * 等待组件内部异步动作（renaming / archiving）落定。
- *
- * `commitRename` 是 async 函数，事件处理器用 `void` 丢弃了它的 promise
- * （真实浏览器里也一样），所以测试需要显式把微任务队列推空，再刷新渲染。
- */
 async function settle(h) {
   for (let round = 0; round < 8; round += 1) {
     await Promise.resolve();
@@ -290,6 +288,48 @@ async function settle(h) {
   }
   return h.latest;
 }
+
+/* ------------------------------------------------------------------ *
+ * 遍历与事件辅助
+ * ------------------------------------------------------------------ */
+
+function walk(element, visit) {
+  if (element === null || typeof element !== "object") return;
+  if (Array.isArray(element)) {
+    for (const child of element) walk(child, visit);
+    return;
+  }
+  if (element.$$dsnElement === true) {
+    visit(element);
+    walk(element.props.children, visit);
+  }
+}
+
+function collect(element, match) {
+  const found = [];
+  walk(element, (node) => { if (match(node)) found.push(node); });
+  return found;
+}
+
+/** 类名精确匹配（`dsn-action` 与 `dsn-actions` 必须区分开）。 */
+const hasClass = (name) => (element) => {
+  const className = element.props.className;
+  if (typeof className !== "string") return false;
+  return className.split(/\s+/).includes(name);
+};
+
+function dispatch(element, handler, event = {}, h = undefined) {
+  assert.ok(element, `期望存在带 ${handler} 的元素`);
+  const fn = element.props[handler];
+  assert.equal(typeof fn, "function", `期望存在 ${handler} 处理函数`);
+  const result = fn({ preventDefault() {}, stopPropagation() {}, target: {}, key: undefined, ...event });
+  if (h !== undefined) h.flush();
+  return result;
+}
+
+/* ------------------------------------------------------------------ *
+ * 夹具
+ * ------------------------------------------------------------------ */
 
 const childRow = (sessionId, parentId, extra = {}) => ({
   sessionId,
@@ -301,319 +341,418 @@ const childRow = (sessionId, parentId, extra = {}) => ({
   ...extra,
 });
 
-test("通过 ctx.effect 安装样式，并只注册一个页头动作条目", () => {
-  const h = harness();
-  assert.equal(h.registration.options.name, "conversation.session.header.actions");
-  assert.equal(h.registration.options.id, "subagents-names");
-  assert.equal(h.registration.options.order, -4);
-  assert.equal(typeof h.registration.options.inject, "function");
-  assert.equal(h.effects.length, 1, "样式副作用必须属于插件 fiber");
-  assert.equal(h.documentStub.head.appendChild !== undefined, true);
+const parentRow = (sessionId, extra = {}) => ({
+  sessionId,
+  displayTitle: sessionId,
+  running: false,
+  updatedAt: 0,
+  ...extra,
 });
 
-test("会话没有任何子代理时完全不渲染", () => {
-  const h = harness();
-  assert.equal(render(h, { byId: {} }), null);
+const catalogEntry = (id, extra = {}) => ({
+  kind: "child",
+  id,
+  activity: "inactive",
+  hasChildren: false,
+  mode: "continuable",
+  label: id,
+  ...extra,
 });
 
-test("渲染触发器，统计全部可见后代并隐藏已归档项", () => {
-  const byId = {
-    parent: { sessionId: "parent", displayTitle: "父会话", running: false },
-    a: childRow("a", "parent", { running: true, updatedAt: 2 }),
-    b: childRow("b", "parent", { updatedAt: 1 }),
-    c: childRow("c", "b", { updatedAt: 0 }),
-  };
-  const h = harness();
-  const tree = render(h, { byId });
-  const trigger = find(tree, byClass("dsn-trigger"))[0];
-  assert.ok(trigger, "必须渲染触发器");
-  assert.equal(find(trigger, byClass("dsn-count"))[0].props.children, "3");
-
-  const archived = render(h, { byId, archivedSessionIds: ["c"] });
-  assert.equal(find(archived, byClass("dsn-count"))[0].props.children, "2");
+const readyCatalog = (entries, extra = {}) => ({
+  entries,
+  parentAvailable: true,
+  state: "ready",
+  error: null,
+  ...extra,
 });
 
-test("标题优先级：持久标题 > 目录标签 > 会话 id", () => {
-  const byId = {
-    parent: { sessionId: "parent", running: false },
-    titled: childRow("titled", "parent", { title: "持久标题", updatedAt: 3 }),
-    labelled: childRow("labelled", "parent", { updatedAt: 2 }),
-    bare: childRow("bare", "parent", { updatedAt: 1 }),
-  };
-  const subagentsByParent = {
-    parent: {
-      parentAvailable: true,
-      entries: [
-        { kind: "child", id: "titled", mode: "continuable", label: "目录标签" },
-        { kind: "child", id: "labelled", mode: "continuable", label: "目录标签" },
-        { kind: "child", id: "bare", mode: "one-shot" },
-      ],
+/** 打开展的根会话：父会话 + 两个子代理。 */
+function openedFixture(overrides = {}) {
+  return {
+    lineageSessionId: "parent",
+    rows: {
+      parent: parentRow("parent"),
+      a: childRow("a", "parent", { running: true, updatedAt: 2 }),
+      b: childRow("b", "parent", { updatedAt: 1 }),
+      ...(overrides.rows ?? {}),
     },
+    catalogs: {
+      parent: readyCatalog([
+        catalogEntry("a", { activity: "running", label: "第一个" }),
+        catalogEntry("b", { label: "第二个" }),
+      ]),
+      ...(overrides.catalogs ?? {}),
+    },
+    ...overrides,
   };
-  const h = harness();
-  render(h, { byId, subagentsByParent });
-  dispatch(find(h.latest, byClass("dsn-trigger"))[0], "onClick", {}, h);
-  const titles = find(h.latest, byClass("dsn-rowTitle")).map((element) => element.props.children);
-  assert.deepEqual(titles, ["持久标题", "目录标签", "bare"]);
+}
+
+/**
+ * 渲染并打开下拉，返回当前树。
+ *
+ * 打开入口分两种（与官方一致）：子代理会话的切换器按钮带 `onClick`；根会话的
+ * 计数触发器没有 `onClick`，靠根节点上的 `onMouseEnter` 悬停 150ms 打开。
+ */
+async function open(h, props) {
+  render(h, props);
+  const trigger = collect(h.latest, hasClass("dsn-trigger"))[0];
+  assert.ok(trigger, "必须渲染计数触发器");
+  if (typeof trigger.props.onClick === "function") {
+    dispatch(trigger, "onClick", {}, h);
+  } else {
+    const root = collect(h.latest, hasClass("dsn-root"))[0];
+    assert.ok(root, "必须渲染根节点");
+    assert.equal(typeof root.props.onMouseEnter, "function", "根节点必须提供悬停打开");
+    dispatch(root, "onMouseEnter", {}, h);
+    await new Promise((resolve) => setTimeout(resolve, 220));
+  }
+  await settle(h);
+  return h.latest;
+}
+
+/** 打开某一行的重命名编辑器。 */
+function beginRename(h, label) {
+  const button = collect(h.latest, (node) => node.props["aria-label"] === `重命名 ${label}`)[0];
+  assert.ok(button, `必须存在「重命名 ${label}」入口`);
+  dispatch(button, "onClick", {}, h);
+  const input = collect(h.latest, hasClass("dsn-editInput"))[0];
+  assert.ok(input, "必须打开行内编辑器");
+  return input;
+}
+
+function save(h) {
+  const button = collect(h.latest, (node) => node.props["data-save"] === true)[0];
+  assert.ok(button, "必须存在保存按钮");
+  return dispatch(button, "onClick", {}, h);
+}
+
+/* ------------------------------------------------------------------ *
+ * 座席接管
+ * ------------------------------------------------------------------ */
+
+test("接管官方谱系座席，并以显式优先级压过官方条目", () => {
+  const h = harness({ current: "parent" });
+  assert.equal(h.registration.options.name, "conversation.session.header.lineage");
+  assert.equal(h.registration.options.registrant, "dsh-subagents-names");
+  // single 座席同格位同优先级会抛错，必须显式低于官方默认的 0。
+  assert.ok(h.registration.options.priority < 0, "必须以更低 priority 接管 single 座席");
 });
 
-test("默认停留在未完成页签，不会把已完成项当作运行中", () => {
-  const byId = {
-    parent: { sessionId: "parent", running: false },
-    live: childRow("live", "parent", { running: true, updatedAt: 2 }),
-    done: childRow("done", "parent", { updatedAt: 1 }),
-  };
-  const h = harness();
-  const tree = render(h, { byId });
-  dispatch(find(tree, byClass("dsn-trigger"))[0], "onClick", {}, h);
+test("注入面暴露官方同款的目录动作", () => {
+  const h = harness({ current: "parent" });
+  const injected = h.registration.options.inject();
+  assert.equal(typeof injected.openChild, "function");
+  assert.equal(typeof injected.refresh, "function");
+  assert.equal(typeof injected.setCatalogOpen, "function");
+  assert.equal(typeof injected.archiveSession, "function");
 
-  const tabs = find(h.latest, byClass("dsn-tab"));
-  assert.equal(tabs[0].props["aria-selected"], true);
-  assert.equal(tabs[0].props.children[1].props.children, 1);
-  assert.equal(tabs[1].props.children[1].props.children, 1);
-  assert.deepEqual(find(h.latest, byClass("dsn-rowTitle")).map((element) => element.props.children), ["live"]);
-});
-
-test("打开面板会登记目录消费并向每个父会话请求刷新", async () => {
-  const byId = {
-    parent: { sessionId: "parent", running: false },
-    a: childRow("a", "parent", { updatedAt: 1 }),
-  };
-  const h = harness();
-  globalThis.__DSN_DEBUG__ = true;
-  const tree = render(h, { byId });
-  dispatch(find(tree, byClass("dsn-trigger"))[0], "onClick", {}, h);
-  globalThis.__DSN_DEBUG__ = false;
-
-  assert.ok(find(h.latest, byClass("dsn-panel"))[0], "点击后面板必须打开");
-  // 关闭态会先释放登记；随后打开态登记一次。这里验证“最终处于已登记状态”，
-  // 而不锁定清理/重跑的具体次数（真实 React 在依赖变化时的重跑次数取决于
-  // 渲染次数，不是契约的一部分）。
-  assert.deepEqual(h.calls.catalogOpen.at(-1), ["parent", true]);
-  assert.equal(h.calls.catalogOpen.filter(([, open]) => open).length, 1);
-  await Promise.resolve();
+  const address = { parentSessionId: "parent", childSessionId: "a", mode: "continuable" };
+  injected.openChild(address);
+  injected.refresh("parent");
+  injected.setCatalogOpen("parent", true);
+  assert.deepEqual(h.calls.openSubagent, [address]);
   assert.deepEqual(h.calls.refreshSubagents, ["parent"]);
+  assert.deepEqual(h.calls.catalogOpen, [["parent", true]]);
 });
 
-test("宿主接受时，重命名写入持久会话标题", async () => {
-  const byId = {
-    parent: { sessionId: "parent", running: false },
-    a: childRow("a", "parent", { updatedAt: 1 }),
-  };
+test("根会话渲染计数触发器，子代理会话渲染面包屑切换器", async () => {
+  const h = harness({ current: "parent" });
+  render(h, openedFixture());
+  const countTrigger = collect(h.latest, hasClass("dsn-trigger"))[0];
+  assert.ok(countTrigger, "根会话必须有计数触发器");
+  // 有运行中的后代时，无障碍名称切到运行态文案（官方同款）。
+  assert.equal(countTrigger.props["aria-label"], "1 个子代理，正在运行");
+  assert.equal(collect(h.latest, hasClass("dsn-switcherTrigger")).length, 0);
+
+  const child = harness({ current: "a" });
+  render(child, {
+    lineageSessionId: "a",
+    displayTitle: "父标题",
+    rows: { parent: parentRow("parent"), a: childRow("a", "parent") },
+    catalogs: { parent: readyCatalog([catalogEntry("a", { label: "目录名" })]) },
+  });
+  const switcher = collect(child.latest, hasClass("dsn-switcherTrigger"))[0];
+  assert.ok(switcher, "子代理会话必须有兄弟切换器");
+  assert.equal(collect(child.latest, hasClass("dsn-switcherTitle"))[0].props.children, "目录名");
+});
+
+/* ------------------------------------------------------------------ *
+ * 菜单内容
+ * ------------------------------------------------------------------ */
+
+test("菜单按目录渲染行，并保留模式与运行状态", async () => {
+  const h = harness({ current: "parent" });
+  const tree = await open(h, openedFixture());
+
+  assert.deepEqual(
+    collect(tree, hasClass("dsn-label")).map((node) => node.props.children),
+    ["第一个", "第二个"],
+  );
+  const summaries = collect(tree, hasClass("dsn-summary")).map((node) => node.props.children);
+  assert.ok(summaries[0].includes("可继续"), `副标题应含模式：${summaries[0]}`);
+  assert.ok(summaries[0].includes("正在运行"), `副标题应含活动：${summaries[0]}`);
+});
+
+test("行标题优先级：持久标题优先于目录创建标签", async () => {
+  const h = harness({ current: "parent" });
+  const tree = await open(h, {
+    lineageSessionId: "parent",
+    rows: {
+      parent: parentRow("parent"),
+      a: childRow("a", "parent", { title: "持久标题" }),
+    },
+    catalogs: { parent: readyCatalog([catalogEntry("a", { label: "目录标签" })]) },
+  });
+  // 这是与官方的关键差异：官方主标签只用 entry.label。
+  assert.deepEqual(
+    collect(tree, hasClass("dsn-label")).map((node) => node.props.children),
+    ["持久标题"],
+  );
+});
+
+test("每行都提供重命名入口；运行中的行归档按钮禁用", async () => {
+  const h = harness({ current: "parent" });
+  const tree = await open(h, openedFixture());
+
+  assert.equal(collect(tree, (node) => node.props["aria-label"]?.startsWith("重命名 ")).length, 2);
+
+  const archiveButtons = collect(tree, (node) => node.props["data-danger"] === true);
+  assert.equal(archiveButtons.length, 2);
+  assert.equal(archiveButtons[0].props.disabled, true, "运行中的子代理不可归档");
+  assert.equal(archiveButtons[1].props.disabled, false);
+});
+
+test("展开分支会向运行时登记子目录消费", async () => {
+  const h = harness({ current: "parent" });
+  const tree = await open(h, {
+    lineageSessionId: "parent",
+    rows: {
+      parent: parentRow("parent"),
+      a: childRow("a", "parent"),
+      a1: childRow("a1", "a"),
+    },
+    catalogs: {
+      parent: readyCatalog([catalogEntry("a", { hasChildren: true })]),
+      a: readyCatalog([catalogEntry("a1", { label: "孙代" })]),
+    },
+  });
+
+  const disclosure = collect(tree, hasClass("dsn-disclosure"))[0];
+  assert.ok(disclosure, "有下级的行必须渲染展开控件");
+  dispatch(disclosure, "onClick", {}, h);
+
+  assert.ok(h.calls.catalogOpen.some(([id, value]) => id === "a" && value === true));
+  assert.deepEqual(
+    collect(h.latest, hasClass("dsn-label")).map((node) => node.props.children),
+    ["a", "孙代"],
+  );
+});
+
+test("已归档的子代理不出现在菜单里", async () => {
+  const h = harness({ current: "parent" });
+  const tree = await open(h, { ...openedFixture(), archivedSessionIds: ["a"] });
+  assert.deepEqual(
+    collect(tree, hasClass("dsn-label")).map((node) => node.props.children),
+    ["第二个"],
+  );
+});
+
+test("空目录显示加载占位，错误目录显示错误与重试", async () => {
+  const h = harness({ current: "parent" });
+  const loading = await open(h, {
+    lineageSessionId: "parent",
+    rows: { parent: parentRow("parent"), a: childRow("a", "parent") },
+    catalogs: { parent: { entries: [], parentAvailable: true, state: "loading", error: null } },
+  });
+  // 目录尚未水合时，先用已知的直接子会话形状占位（官方同款）。
+  assert.equal(collect(loading, hasClass("dsn-loadingRow")).length, 1);
+  assert.equal(collect(loading, hasClass("dsn-notice")).length, 0);
+
+  const errored = await open(h, {
+    lineageSessionId: "parent",
+    rows: { parent: parentRow("parent"), a: childRow("a", "parent") },
+    catalogs: { parent: { entries: [], parentAvailable: true, state: "error", error: { message: "炸了" } } },
+  });
+  const errorBox = collect(errored, hasClass("dsn-error"))[0];
+  assert.ok(errorBox, "错误目录必须渲染错误行");
+  assert.ok(collect(errorBox, hasClass("dsn-action")).length >= 1, "错误行必须提供重试按钮");
+});
+
+/* ------------------------------------------------------------------ *
+ * 重命名路径
+ * ------------------------------------------------------------------ */
+
+test("宿主接受时写入持久标题，并清掉同 id 的本地别名", async () => {
+  // 别名 store 在 bundle 物化时读取 localStorage，预置数据必须早于 harness。
   const h = harness({
+    current: "parent",
+    localStorageSeed: { "dsh-subagents-names/display-names": JSON.stringify({ a: "旧别名" }) },
     binding: (id) => (id === "a"
       ? {
           session: {
             rename: (title) => {
               h.calls.rename.push(title);
-              return Promise.resolve({ ok: true, value: { title, seq: 7 } });
+              return Promise.resolve({ ok: true, value: { title, seq: 3 } });
             },
           },
         }
       : undefined),
   });
-  render(h, { byId });
-  dispatch(find(h.latest, byClass("dsn-trigger"))[0], "onClick", {}, h);
-  dispatch(find(h.latest, byClass("dsn-iconButton"))[0], "onClick", {}, h);
 
-  const input = find(h.latest, byClass("dsn-editInput"))[0];
-  assert.ok(input, "必须打开行内编辑器");
-  dispatch(input, "onChange", { target: { value: "新名字" } }, h);
-  await dispatch(find(h.latest, byClass("dsn-save"))[0], "onClick");
+  await open(h, openedFixture());
+  beginRename(h, "旧别名");
+  dispatch(collect(h.latest, hasClass("dsn-editInput"))[0], "onChange", { target: { value: "新名字" } }, h);
+  await save(h);
   await settle(h);
 
   assert.deepEqual(h.calls.rename, ["新名字"]);
-  assert.equal(h.localStorageData.get("dsh-subagents-names/display-names"), "{}", "持久标题生效后不应留下别名");
-  assert.equal(find(h.latest, byClass("dsn-note")).length, 1);
-  assert.equal(find(h.latest, byClass("dsn-rowTitle"))[0].props.children, "a");
+  assert.equal(h.localStorageData.get("dsh-subagents-names/display-names"), "{}", "持久标题生效后不应保留别名");
 });
 
-test("被所有权围栏拒绝的子代理回退到面板本地别名", async () => {
-  const byId = {
-    parent: { sessionId: "parent", running: false },
-    a: childRow("a", "parent", { updatedAt: 1 }),
-  };
+test("被 agent-busy 围栏拒绝时回退为面板本地别名", async () => {
   const h = harness({
-    binding: (id) => (id === "a"
+    current: "parent",
+    binding: (id) => (id === "b"
       ? {
           session: {
             rename: (title) => {
               h.calls.rename.push(title);
               return Promise.resolve({
                 ok: false,
-                error: { code: "agent-busy", message: 'session "a" is owned by subagent routing', details: {} },
+                error: { code: "agent-busy", message: "owned by subagent routing", details: {} },
               });
             },
           },
         }
       : undefined),
   });
-  render(h, { byId });
-  dispatch(find(h.latest, byClass("dsn-trigger"))[0], "onClick", {}, h);
-  dispatch(find(h.latest, byClass("dsn-iconButton"))[0], "onClick", {}, h);
-
-  const input = find(h.latest, byClass("dsn-editInput"))[0];
-  dispatch(input, "onChange", { target: { value: "别名" } }, h);
-  await dispatch(find(h.latest, byClass("dsn-save"))[0], "onClick");
+  await open(h, openedFixture());
+  beginRename(h, "第二个");
+  dispatch(collect(h.latest, hasClass("dsn-editInput"))[0], "onChange", { target: { value: "本地名" } }, h);
+  await save(h);
   await settle(h);
 
-  assert.deepEqual(find(h.latest, byClass("dsn-rowTitle")).map((element) => element.props.children), ["别名"]);
-  assert.equal(h.localStorageData.get("dsh-subagents-names/display-names"), JSON.stringify({ a: "别名" }));
-  assert.equal(find(h.latest, byClass("dsn-note")).length, 0);
-  assert.equal(find(h.latest, byClass("dsn-error")).length, 0);
+  assert.deepEqual(h.calls.rename, ["本地名"]);
+  assert.equal(h.localStorageData.get("dsh-subagents-names/display-names"), JSON.stringify({ b: "本地名" }));
+  assert.deepEqual(
+    collect(h.latest, hasClass("dsn-label")).map((node) => node.props.children),
+    ["第一个", "本地名"],
+  );
 });
 
-test("非所有权类失败会报错，不会伪装成成功", async () => {
-  const byId = {
-    parent: { sessionId: "parent", running: false },
-    a: childRow("a", "parent", { updatedAt: 1 }),
-  };
+test("非所有权类失败会就地报错，不写别名也不关闭编辑器", async () => {
   const h = harness({
+    current: "parent",
     binding: () => ({
-      session: {
-        rename: () => Promise.resolve({ ok: false, error: { code: "internal", message: "boom", details: {} } }),
-      },
+      session: { rename: () => Promise.resolve({ ok: false, error: { code: "internal", message: "boom", details: {} } }) },
     }),
   });
-  render(h, { byId });
-  dispatch(find(h.latest, byClass("dsn-trigger"))[0], "onClick", {}, h);
-  dispatch(find(h.latest, byClass("dsn-iconButton"))[0], "onClick", {}, h);
-  const input = find(h.latest, byClass("dsn-editInput"))[0];
-  dispatch(input, "onChange", { target: { value: "x" } }, h);
-  await dispatch(find(h.latest, byClass("dsn-save"))[0], "onClick");
+  await open(h, openedFixture());
+  beginRename(h, "第一个");
+  dispatch(collect(h.latest, hasClass("dsn-editInput"))[0], "onChange", { target: { value: "x" } }, h);
+  await save(h);
   await settle(h);
 
-  assert.equal(find(h.latest, byClass("dsn-error"))[0].props.children, "boom");
-  // 失败时只报错，不写入别名，也不留下“已写入持久标题”的提示。
-  assert.equal(h.localStorageData.has("dsh-subagents-names/display-names"), false);
-  assert.equal(find(h.latest, byClass("dsn-note")).length, 0);
+  const error = collect(h.latest, (node) => node.props["data-error"] === true)[0];
+  assert.equal(error.props.children, "boom");
+  assert.equal(h.localStorageData.has("dsh-subagents-names/display-names"), false, "失败不应写入别名");
+  assert.ok(collect(h.latest, hasClass("dsn-editInput"))[0], "失败后编辑器应保持打开");
 });
 
-test("空名称被拒绝，不发起任何重命名", async () => {
-  const byId = {
-    parent: { sessionId: "parent", running: false },
-    a: childRow("a", "parent", { updatedAt: 1 }),
-  };
-  const h = harness({ binding: () => ({ session: { rename: () => Promise.resolve({ ok: true, value: { title: "x", seq: 1 } }) } }) });
-  render(h, { byId });
-  dispatch(find(h.latest, byClass("dsn-trigger"))[0], "onClick", {}, h);
-  dispatch(find(h.latest, byClass("dsn-iconButton"))[0], "onClick", {}, h);
-  const input = find(h.latest, byClass("dsn-editInput"))[0];
-  dispatch(input, "onChange", { target: { value: "   " } }, h);
-  await dispatch(find(h.latest, byClass("dsn-save"))[0], "onClick");
+test("空名称被就地拒绝，不调用宿主", async () => {
+  const h = harness({
+    current: "parent",
+    binding: () => ({ session: { rename: () => Promise.resolve({ ok: true, value: { title: "x", seq: 1 } }) } }),
+  });
+  await open(h, openedFixture());
+  beginRename(h, "第一个");
+  dispatch(collect(h.latest, hasClass("dsn-editInput"))[0], "onChange", { target: { value: "   " } }, h);
+  await save(h);
   await settle(h);
 
   assert.deepEqual(h.calls.rename, []);
-  assert.equal(find(h.latest, byClass("dsn-error"))[0].props.children, "名称不能为空。");
+  assert.equal(
+    collect(h.latest, (node) => node.props["data-error"] === true)[0].props.children,
+    "名称不能为空。",
+  );
 });
 
-test("仅在已完成页签、且不在当前轮时提供归档", async () => {
-  const byId = {
-    parent: { sessionId: "parent", running: true },
-    done: childRow("done", "parent", { updatedAt: 2 }),
-    live: childRow("live", "parent", { running: true, updatedAt: 1 }),
-  };
-  const h = harness({ archiveSession: () => Promise.resolve() });
-  render(h, { byId });
-  dispatch(find(h.latest, byClass("dsn-trigger"))[0], "onClick", {}, h);
+test("Escape 取消编辑且不触发任何重命名", async () => {
+  const h = harness({ current: "parent" });
+  await open(h, openedFixture());
+  const input = beginRename(h, "第一个");
+  dispatch(input, "onKeyDown", { key: "Escape" }, h);
 
-  // 首次观察到运行中的父会话时，全部可见子项都受保护。
-  assert.equal(find(h.latest, (element) => element.props["data-danger"] === true).length, 0);
-
-  dispatch(find(h.latest, byClass("dsn-tab"))[1], "onClick", {}, h);
-  const buttons = find(h.latest, (element) => element.props["data-danger"] === true);
-  assert.equal(buttons.length, 1);
-  assert.equal(buttons[0].props.disabled, true);
-
-  dispatch(buttons[0], "onClick");
-  await Promise.resolve();
-  assert.deepEqual(h.calls.archiveSession, [], "受保护的当前轮子项不得被归档");
+  assert.equal(collect(h.latest, hasClass("dsn-editInput")).length, 0);
+  assert.deepEqual(h.calls.rename, []);
 });
 
-test("未受保护的已完成子项通过 ctx.workspaces 归档", async () => {
-  const byId = {
-    parent: { sessionId: "parent", running: false },
-    old: childRow("old", "parent", { updatedAt: 1 }),
-  };
-  const h = harness({ archiveSession: () => Promise.resolve() });
-  render(h, { byId });
-  dispatch(find(h.latest, byClass("dsn-trigger"))[0], "onClick", {}, h);
-  dispatch(find(h.latest, byClass("dsn-tab"))[1], "onClick", {}, h);
+/* ------------------------------------------------------------------ *
+ * 归档路径
+ * ------------------------------------------------------------------ */
 
-  const buttons = find(h.latest, (element) => element.props["data-danger"] === true);
-  assert.equal(buttons[0].props.disabled, false);
-  dispatch(buttons[0], "onClick");
-  await Promise.resolve();
-  assert.deepEqual(h.calls.archiveSession, ["old"]);
-});
-
-test("归档失败会在面板内报错", async () => {
-  const byId = {
-    parent: { sessionId: "parent", running: false },
-    old: childRow("old", "parent", { updatedAt: 1 }),
-  };
-  const h = harness({ archiveSession: () => Promise.reject(new Error("归档失败")) });
-  render(h, { byId });
-  dispatch(find(h.latest, byClass("dsn-trigger"))[0], "onClick", {}, h);
-  dispatch(find(h.latest, byClass("dsn-tab"))[1], "onClick", {}, h);
-  dispatch(find(h.latest, (element) => element.props["data-danger"] === true)[0], "onClick", {}, h);
+test("完成且不受保护的子代理通过工作区归档", async () => {
+  const h = harness({ current: "parent" });
+  await open(h, openedFixture());
+  const archive = collect(h.latest, (node) => node.props["data-danger"] === true)[1];
+  assert.equal(archive.props.disabled, false);
+  dispatch(archive, "onClick", {}, h);
   await settle(h);
 
-  assert.equal(find(h.latest, byClass("dsn-error"))[0].props.children, "归档失败");
+  assert.deepEqual(h.calls.archive, ["b"]);
 });
 
-test("点击行优先使用运行时保留的地址打开子代理", () => {
-  const byId = {
-    parent: { sessionId: "parent", running: false },
-    a: childRow("a", "parent", { updatedAt: 1 }),
-  };
-  const address = { parentSessionId: "parent", childSessionId: "a", mode: "continuable" };
-  const h = harness({ addresses: { a: address } });
-  render(h, { byId });
-  dispatch(find(h.latest, byClass("dsn-trigger"))[0], "onClick", {}, h);
-  dispatch(find(h.latest, byClass("dsn-row"))[0], "onClick", {}, h);
+test("归档失败会显示错误行", async () => {
+  const h = harness({ current: "parent", archiveSession: () => Promise.reject(new Error("归档炸了")) });
+  await open(h, openedFixture());
+  dispatch(collect(h.latest, (node) => node.props["data-danger"] === true)[1], "onClick", {}, h);
+  await settle(h);
 
-  assert.deepEqual(h.calls.openSubagent, [address]);
-  assert.deepEqual(h.calls.open, []);
+  assert.equal(collect(h.latest, hasClass("dsn-error"))[0].props.children, "归档炸了");
 });
 
-test("没有保留地址时回退到目录地址，再回退到普通打开", () => {
-  const byId = {
-    parent: { sessionId: "parent", running: false },
-    a: childRow("a", "parent", { updatedAt: 1 }),
-  };
-  const plain = harness({ addresses: {} });
-  render(plain, { byId });
-  dispatch(find(plain.latest, byClass("dsn-trigger"))[0], "onClick", {}, plain);
-  dispatch(find(plain.latest, byClass("dsn-row"))[0], "onClick", {}, plain);
-  assert.deepEqual(plain.calls.open, ["a"], "没有目录条目时直接普通打开");
-
-  const viaCatalog = harness({ addresses: {} });
-  render(viaCatalog, {
-    byId,
-    subagentsByParent: {
-      parent: { parentAvailable: true, entries: [{ kind: "child", id: "a", mode: "one-shot" }] },
+test("当前轮生成的子代理保持受保护", async () => {
+  const h = harness({ current: "parent" });
+  const tree = await open(h, {
+    lineageSessionId: "parent",
+    rows: {
+      parent: parentRow("parent", { running: true }),
+      a: childRow("a", "parent"),
+      b: childRow("b", "parent"),
     },
+    catalogs: { parent: readyCatalog([catalogEntry("a"), catalogEntry("b")]) },
   });
-  dispatch(find(viaCatalog.latest, byClass("dsn-trigger"))[0], "onClick", {}, viaCatalog);
-  dispatch(find(viaCatalog.latest, byClass("dsn-row"))[0], "onClick", {}, viaCatalog);
+
+  const archives = collect(tree, (node) => node.props["data-danger"] === true);
+  assert.equal(archives.length, 2);
+  assert.ok(archives.every((node) => node.props.disabled === true), "当前轮子代理的归档必须禁用");
+});
+
+/* ------------------------------------------------------------------ *
+ * 导航
+ * ------------------------------------------------------------------ */
+
+test("点击行按目录地址打开子代理并收起菜单", async () => {
+  const h = harness({ current: "parent" });
+  const tree = await open(h, openedFixture());
+  dispatch(collect(tree, (node) => node.props.role === "treeitem")[0], "onClick", {}, h);
+
   // bundle 与测试运行在不同 realm，对象原型不同，因此比较序列化结果。
   assert.equal(
-    JSON.stringify(viaCatalog.calls.openSubagent),
-    JSON.stringify([{ parentSessionId: "parent", childSessionId: "a", mode: "one-shot" }]),
+    JSON.stringify(h.calls.openSubagent),
+    JSON.stringify([{ parentSessionId: "parent", childSessionId: "a", mode: "continuable" }]),
   );
-  assert.deepEqual(viaCatalog.calls.open, []);
+  assert.deepEqual(h.calls.catalogOpen.at(-1), ["parent", false], "打开后必须收起菜单");
 });
 
-test("键盘 Enter 也能打开行", () => {
-  const byId = {
-    parent: { sessionId: "parent", running: false },
-    a: childRow("a", "parent", { updatedAt: 1 }),
-  };
-  const h = harness({ addresses: {} });
-  render(h, { byId });
-  dispatch(find(h.latest, byClass("dsn-trigger"))[0], "onClick", {}, h);
-  const row = find(h.latest, byClass("dsn-row"))[0];
-  dispatch(row, "onKeyDown", { key: "Enter" }, h);
-  assert.deepEqual(h.calls.open, ["a"]);
+test("键盘 Enter 也能打开子代理", async () => {
+  const h = harness({ current: "parent" });
+  const tree = await open(h, openedFixture());
+  dispatch(collect(tree, (node) => node.props.role === "treeitem")[0], "onKeyDown", { key: "Enter" }, h);
+
+  assert.equal(
+    JSON.stringify(h.calls.openSubagent),
+    JSON.stringify([{ parentSessionId: "parent", childSessionId: "a", mode: "continuable" }]),
+  );
 });
