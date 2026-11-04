@@ -10,7 +10,7 @@ import { dirname, join, relative } from "node:path";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const SKIP_DIRS = new Set([".git", "node_modules"]);
-const TEXT_EXTENSIONS = new Set([".js", ".mjs", ".cjs", ".json", ".yml", ".yaml", ".md", ".txt", ".xml"]);
+const TEXT_EXTENSIONS = new Set([".ts", ".js", ".mjs", ".cjs", ".json", ".yml", ".yaml", ".md", ".txt", ".xml"]);
 
 /** 递归收集需要检查的文件。 */
 function collect(dir, found = []) {

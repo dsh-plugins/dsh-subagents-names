@@ -90,7 +90,17 @@ dsh plugin --profile desktop add dsh-subagents-names
 
 ## Development
 
+Runtime sources live in `src/` and are compiled with strict TypeScript to the existing
+`lib/index.js` and `lib/client.js` entry points. The browser entry remains a classic
+`window.__ModuleLoader__.load` script; React and DSH services are supplied by the host,
+not bundled. `src/client-contracts.d.ts` describes that host boundary without adding
+runtime dependencies. Edit `src/`, run `npm run build`, and commit the generated `lib/`
+files so direct checkouts remain usable. `npm test` and `npm pack` build automatically;
+the published host API includes TypeScript declarations.
+
 ```powershell
+npm ci
+npm run typecheck
 npm test
 ```
 
