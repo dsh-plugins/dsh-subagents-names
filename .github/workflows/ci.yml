@@ -34,10 +34,16 @@ jobs:
         uses: actions/setup-node@v6.4.0
         with:
           node-version: ${{ env.NODE_VERSION }}
+      - name: 安装开发依赖
+        run: npm ci
+      - name: TypeScript 类型检查
+        run: npm run typecheck
       - name: 编码检查（UTF-8 无 BOM）
         run: npm run check:encoding
       - name: 运行测试
         run: npm test
+      - name: 检查生成文件已同步
+        run: git diff --exit-code -- lib
       - name: 检查即将发布的包内容
         run: npm pack --dry-run
 
@@ -60,6 +66,8 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
           registry-url: ${{ env.NPM_REGISTRY }}
+      - name: 安装开发依赖
+        run: npm ci
       - name: 校验 tag 与 package.json 版本一致
         shell: bash
         env:

@@ -5,7 +5,10 @@
   "type": "module",
   "main": "lib/index.js",
   "exports": {
-    ".": "./lib/index.js",
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
     "./client": "./lib/client.js",
     "./package.json": "./package.json"
   },
@@ -32,8 +35,11 @@
     }
   },
   "scripts": {
-    "test": "node scripts/check-encoding.mjs && node --test \"test/*.test.mjs\"",
-    "check:encoding": "node scripts/check-encoding.mjs"
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node scripts/check-encoding.mjs && node --test \"test/*.test.mjs\"",
+    "check:encoding": "node scripts/check-encoding.mjs",
+    "prepack": "npm run build"
   },
   "engines": {
     "node": ">=22.19.0"
@@ -66,5 +72,11 @@
     "dsh-plugin",
     "subagent",
     "workflow"
-  ]
+  ],
+  "devDependencies": {
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "typescript": "^5.9.3"
+  },
+  "types": "lib/index.d.ts"
 }

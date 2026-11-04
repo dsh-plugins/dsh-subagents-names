@@ -109,7 +109,16 @@ dsh plugin --profile desktop add dsh-subagents-names
 
 ## 开发
 
+运行时代码位于 `src/`，通过严格 TypeScript 编译生成原有的 `lib/index.js` 和
+`lib/client.js` 入口。浏览器入口仍为 `window.__ModuleLoader__.load` 普通脚本，
+React 与 DSH 服务由宿主提供，不会打包进插件。`src/client-contracts.d.ts` 描述
+宿主边界，不引入运行时依赖。请修改 `src/`，执行 `npm run build` 并提交生成的
+`lib/` 文件，以便直接使用源码检出目录。`npm test` 和 `npm pack` 会自动构建，
+发布包同时包含宿主 API 的 TypeScript 声明。
+
 ```powershell
+npm ci
+npm run typecheck
 npm test
 ```
 
